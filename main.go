@@ -11,6 +11,7 @@ import (
 	"time"
 )
 
+//MyApp
 // newMux builds the HTTP routes. It is separate from main so tests can use it.
 func newMux() *http.ServeMux {
 	mux := http.NewServeMux()
