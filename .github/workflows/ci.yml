@@ -84,7 +84,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload coverage profile
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage
           path: coverage.out
@@ -115,7 +115,7 @@ jobs:
           (cd dist && sha256sum hello-svc | tee SHA256SUMS)
 
       - name: Upload binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: hello-svc-linux-amd64
           path: dist/
