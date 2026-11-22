@@ -1,0 +1,16 @@
+version: 2
+updates:
+  # Keeps the action versions in ci.yml current (and is how pinned versions stay patched).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+  # Updates the base images in the Dockerfile.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly

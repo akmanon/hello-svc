@@ -1,0 +1,17 @@
+.git
+.github
+.gitignore
+Dockerfile*
+.dockerignore
+*.md
+*_test.go
+*.test
+*.out
+coverage.out
+dist/
+bin/
+tmp/
+.env
+.env.*
+.vscode/
+.idea/

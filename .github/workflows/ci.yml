@@ -1,0 +1,256 @@
+name: CI
+
+# Runs on every pull request and on every push to main.
+# `pull_request` (not `pull_request_target`) is deliberate: code from forks runs
+# with a read-only token and no secrets.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege by default. Jobs that need more ask for it explicitly.
+permissions:
+  contents: read
+
+# A new push to the same PR cancels the older run. Runs on main are never cancelled.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  GOFLAGS: -mod=readonly
+
+jobs:
+  # ---------------------------------------------------------------- 1. lint
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.mod # add go.sum here once the module has dependencies
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go.mod is tidy
+        run: go mod tidy -diff
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.64.8
+
+  # ---------------------------------------------------------------- 2. test
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.mod
+
+      - name: Verify module checksums
+        run: go mod verify
+
+      - name: Test (race detector on, cache bypassed)
+        run: go test -race -count=1 -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Coverage summary
+        run: |
+          {
+            echo "### Test coverage"
+            echo '```'
+            go tool cover -func=coverage.out | tail -n 1
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage profile
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 7
+
+  # ---------------------------------------------------------------- 3. build
+  build:
+    name: Build binary
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.mod
+
+      - name: Build static linux/amd64 binary
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags="-s -w" -o dist/hello-svc .
+          (cd dist && sha256sum hello-svc | tee SHA256SUMS)
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: hello-svc-linux-amd64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------- 4. docker (build + smoke test, never pushes)
+  docker:
+    name: Docker image
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image (loaded locally, not pushed)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: hello-svc:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Image policy checks
+        run: |
+          user="$(docker image inspect hello-svc:ci --format '{{.Config.User}}')"
+          if [ -z "$user" ] || [ "$user" = "root" ] || [ "$user" = "0" ]; then
+            echo "::error::image runs as root (User='$user')"
+            exit 1
+          fi
+          size="$(docker image inspect hello-svc:ci --format '{{.Size}}')"
+          echo "### Image" >> "$GITHUB_STEP_SUMMARY"
+          echo "User: \`$user\`, size: $((size / 1024 / 1024)) MiB" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Smoke test (starts, answers, stops fast)
+        run: |
+          set -euo pipefail
+          docker run -d --name smoke -p 8080:8080 hello-svc:ci
+
+          ok=0
+          for _ in $(seq 1 30); do
+            if curl -fsS http://localhost:8080/healthz >/dev/null 2>&1; then ok=1; break; fi
+            sleep 0.5
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::service never became healthy"
+            exit 1
+          fi
+
+          curl -fsS http://localhost:8080/ | grep -q '"service":"hello-svc"'
+
+          # PID 1 must handle SIGTERM: a slow stop means Docker fell back to SIGKILL after 10 s.
+          start="$(date +%s)"
+          docker stop smoke >/dev/null
+          elapsed=$(( $(date +%s) - start ))
+          echo "docker stop took ${elapsed}s"
+          if [ "$elapsed" -gt 5 ]; then
+            echo "::error::slow shutdown (${elapsed}s): the app is probably ignoring SIGTERM"
+            exit 1
+          fi
+
+      - name: Container logs
+        if: always()
+        run: |
+          docker logs smoke || true
+          docker rm -f smoke || true
+
+  # ---------------------------------------------------------------- 5. publish (main only, after merge)
+  publish:
+    name: Publish image
+    needs: [docker]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write # only this job can push to the registry
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Lowercase image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+
+      - id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+      - name: Record the digest (deploy by digest, not by tag)
+        run: |
+          {
+            echo "### Published"
+            echo "\`${IMAGE}@${{ steps.push.outputs.digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------- required check
+  # Make THIS job the one required status check in branch protection. It fails if any
+  # required job failed, was cancelled or was skipped, so a skipped job cannot slip through.
+  ci-ok:
+    name: CI passed
+    if: always()
+    needs: [lint, test, build, docker]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail if any required job did not succeed
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}
+        run: |
+          echo "::error::One or more required jobs did not succeed"
+          exit 1
+      - name: All required jobs passed
+        run: echo "ok"
